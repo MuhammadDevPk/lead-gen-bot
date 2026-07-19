@@ -137,7 +137,7 @@ async def save_enriched_contact_async(
         "contact_first_name": contact.get("first_name") if contact else None,
         "contact_last_name": contact.get("last_name") if contact else None,
         "contact_title": contact.get("title") if contact else None,
-        "contact_email": contact.get("email") if contact else None,
+        "contact_email": contact.get("email") if (contact and contact.get("email")) else original_lead.get("contact_email"),
         "contact_email_status": contact.get("email_status") if contact else None,
         "contact_linkedin": contact.get("linkedin_url") if contact else None,
         "lead_qualification_reason": original_lead.get("reason"),
