@@ -12,3 +12,10 @@ wheels/
 # Crawled data
 data/
 
+# Logs
+logs/
+
+# Local environment variables
+.env
+
+
