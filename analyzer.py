@@ -11,7 +11,8 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Set, Optional
+from typing import Set, Optional, List, Dict, Any, Tuple
+import re
 
 import aiofiles
 from dotenv import load_dotenv
@@ -36,14 +37,77 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lead-analyzer")
 
-# Initialize OpenAI Client (reads OPENAI_API_KEY automatically)
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    logger.error("OPENAI_API_KEY environment variable not found. Please set it in your environment or a .env file.")
-    print("Error: OPENAI_API_KEY is not set. Check logs/analyzer.log for details.", file=sys.stderr)
+# Set up active providers list dynamically
+providers: List[Dict[str, Any]] = []
+
+# Prioritize env key if set and valid
+env_openai_key = os.getenv("OPENAI_API_KEY")
+if env_openai_key and not env_openai_key.startswith("your_"):
+    providers.append({
+        "name": "OpenAI - Env Key",
+        "base_url": None,
+        "api_key": env_openai_key,
+        "model": "gpt-4o-mini"
+    })
+
+# Check if data/keys.json exists
+keys_file = Path("data/keys.json")
+if keys_file.exists():
+    try:
+        with open(keys_file, "r", encoding="utf-8") as f:
+            custom_list = json.load(f)
+            if isinstance(custom_list, list):
+                providers.extend(custom_list)
+                logger.info(f"Loaded {len(custom_list)} API providers from {keys_file}")
+    except Exception as e:
+        logger.warning(f"Could not read keys file {keys_file}: {e}")
+
+if not providers:
+    logger.error("No API providers found. Please set OPENAI_API_KEY in .env or populate data/keys.json (which is ignored by Git).")
+    print("Error: No API providers found. Check logs/analyzer.log for details.", file=sys.stderr)
     sys.exit(1)
 
-client = AsyncOpenAI(api_key=openai_api_key)
+# Key Rotation state
+current_provider_index = 0
+provider_lock = asyncio.Lock()
+
+
+async def get_current_client_and_provider() -> Tuple[AsyncOpenAI, Dict[str, Any]]:
+    """Retrieves the currently selected AsyncOpenAI client and provider config."""
+    global current_provider_index
+    async with provider_lock:
+        provider = providers[current_provider_index]
+        client = AsyncOpenAI(
+            api_key=provider["api_key"],
+            base_url=provider["base_url"]
+        )
+        return client, provider
+
+
+async def rotate_provider() -> None:
+    """Rotates the global provider index to the next configured provider."""
+    global current_provider_index
+    async with provider_lock:
+        current_provider_index = (current_provider_index + 1) % len(providers)
+        logger.info(f"Swapped to next API provider: {providers[current_provider_index]['name']}")
+
+
+def extract_json(text: str) -> str:
+    """Helper to extract JSON block from text if wrapped in markdown blocks."""
+    text_clean = text.strip()
+    
+    # Try finding json code block first
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text_clean, re.DOTALL)
+    if match:
+        return match.group(1)
+        
+    # Fallback to finding first '{' and last '}'
+    first_brace = text_clean.find("{")
+    last_brace = text_clean.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        return text_clean[first_brace:last_brace + 1]
+        
+    return text_clean
 
 
 class LeadQualification(BaseModel):
@@ -144,49 +208,84 @@ async def analyze_single_lead(
     output_file: Path,
     semaphore: asyncio.Semaphore
 ) -> None:
-    """Qualifies a single lead by sending its markdown content to OpenAI."""
+    """Qualifies a single lead by sending its markdown content to LLM with API key rotation."""
     async with semaphore:
         logger.info(f"Analyzing: {url}...")
-        try:
-            # Call OpenAI Chat Completions API with Pydantic parsing
-            completion = await client.beta.chat.completions.parse(
-                model="gpt-4o-mini",
-                messages=[
+        
+        max_attempts = len(providers) * 2
+        for attempt in range(max_attempts):
+            client, provider = await get_current_client_and_provider()
+            logger.info(f"Attempt {attempt + 1}/{max_attempts}: Using provider '{provider['name']}' (Model: {provider['model']})")
+            
+            try:
+                # Construct messages payload for JSON output compatibility
+                messages = [
                     {
                         "role": "system",
                         "content": (
                             "You are a B2B Lead Qualifier. Your job is to analyze the text content of a business's website "
                             "(provided in markdown format) and qualify them for web development, booking systems, or booking automation services.\n\n"
                             "Criteria for Qualification:\n"
-                            "1. The business must be service-based (e.g., local home services, medical, beauty, professional services, local instruction/coaching). "
+                            "1. The business must be service-based (e.g., local home services, medical, beauty, local coaching). "
                             "Product-only e-commerce shops, SaaS, news portals, and large enterprises are NOT qualified.\n"
                             "2. The business must meet at least one of these conditions:\n"
                             "   - Lacks a modern interactive booking/scheduling widget (like Calendly, Acuity, or custom booking forms). If they only have a "
                             "basic static form, a phone number, or an email link to schedule, they are qualified.\n"
                             "   - Has a broken, static, or outdated website.\n"
                             "   - Lacks a website (in this context, if the content is extremely minimal or broken, or shows it lacks dynamic features).\n\n"
-                            "Determine if they are qualified, extract their business name and contact email, and compute an automation score."
+                            "Return a JSON object conforming exactly to this schema:\n"
+                            "{\n"
+                            "  \"is_qualified\": boolean,\n"
+                            "  \"reason\": \"Detailed explanation of why this business is or is not qualified, citing specific details from the website content.\",\n"
+                            "  \"business_name\": \"The name of the business or organization.\",\n"
+                            "  \"contact_email\": \"The contact email address found in the website content, or null if none was found.\",\n"
+                            "  \"automation_score\": integer (1 to 100 rating how automated their booking flow is, where 1 = fully manual/static and 100 = highly automated)\n"
+                            "}\n\n"
+                            "CRITICAL: You must output ONLY the raw JSON object and nothing else."
                         )
                     },
                     {
                         "role": "user",
                         "content": f"URL: {url}\n\nWebsite Content (Markdown):\n{markdown_content[:25000]}"
                     }
-                ],
-                response_format=LeadQualification,
-            )
-
-            qualification = completion.choices[0].message.parsed
-            if qualification:
-                logger.info(f"[QUALIFICATION RESULT] {url} -> Qualified: {qualification.is_qualified} | Score: {qualification.automation_score}")
+                ]
+                
+                kwargs = {
+                    "model": provider["model"],
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"}
+                }
+                
+                completion = await client.chat.completions.create(
+                    timeout=30.0,
+                    **kwargs
+                )
+                
+                content = completion.choices[0].message.content
+                if not content:
+                    raise ValueError("Received empty content response from API.")
+                
+                # Extract and parse JSON
+                json_str = extract_json(content)
+                qualification_data = json.loads(json_str)
+                
+                # Parse and validate with Pydantic
+                qualification = LeadQualification.model_validate(qualification_data)
+                
+                logger.info(f"[QUALIFICATION RESULT] {url} -> Qualified: {qualification.is_qualified} | Score: {qualification.automation_score} (via {provider['name']})")
                 await save_analyzed_lead_async(output_file, url, qualification)
-            else:
-                logger.error(f"Failed to parse qualification result for {url} (Empty parsed response).")
-                await save_analyzed_lead_async(output_file, url, None, error="Structured output parsing returned None.")
-
-        except Exception as e:
-            logger.error(f"Error during API call for {url}: {e}", exc_info=True)
-            await save_analyzed_lead_async(output_file, url, None, error=str(e))
+                return  # Success, exit function
+                
+            except Exception as e:
+                logger.warning(f"Provider '{provider['name']}' failed for {url} with error: {e}. Rotating provider...")
+                await rotate_provider()
+                # Loop will retry with next provider
+                
+        # If all attempts fail
+        error_msg = f"All {len(providers)} providers failed to analyze this lead."
+        logger.error(f"[QUALIFICATION FAILED] {url} -> {error_msg}")
+        await save_analyzed_lead_async(output_file, url, None, error=error_msg)
 
 
 async def main_async() -> None:
