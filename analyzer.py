@@ -128,6 +128,10 @@ class LeadQualification(BaseModel):
         None,
         description="The contact email address found in the website content, or null/empty if none was found."
     )
+    contact_emails: List[str] = Field(
+        default_factory=list,
+        description="A list of all unique contact email addresses found in the website content."
+    )
     automation_score: int = Field(
         ...,
         description="An integer from 1 to 100 rating how automated their customer acquisition/booking flow is (1 = fully manual/static, 100 = highly automated with widgets/schedulers)."
@@ -194,6 +198,7 @@ async def save_analyzed_lead_async(file_path: Path, url: str, qualification: Opt
         "reason": qualification.reason if qualification else f"Error: {error}",
         "business_name": qualification.business_name if qualification else "Unknown",
         "contact_email": qualification.contact_email if qualification else None,
+        "contact_emails": qualification.contact_emails if qualification else [],
         "automation_score": qualification.automation_score if qualification else 0,
         "error": error
     }
@@ -205,6 +210,7 @@ async def save_analyzed_lead_async(file_path: Path, url: str, qualification: Opt
 async def analyze_single_lead(
     url: str,
     markdown_content: str,
+    scraped_emails: List[str],
     output_file: Path,
     semaphore: asyncio.Semaphore
 ) -> None:
@@ -233,12 +239,16 @@ async def analyze_single_lead(
                             "basic static form, a phone number, or an email link to schedule, they are qualified.\n"
                             "   - Has a broken, static, or outdated website.\n"
                             "   - Lacks a website (in this context, if the content is extremely minimal or broken, or shows it lacks dynamic features).\n\n"
+                            "Email Harvesting Rules:\n"
+                            "- Extract all valid email addresses found in the website content. Place them in the 'contact_emails' list.\n"
+                            "- Set the primary 'contact_email' to the best direct contact email found. Categorize any valid business email (e.g., info@..., sales@..., hello@..., or staff members) as a valid contact target if a specific owner email is not explicitly present.\n\n"
                             "Return a JSON object conforming exactly to this schema:\n"
                             "{\n"
                             "  \"is_qualified\": boolean,\n"
                             "  \"reason\": \"Detailed explanation of why this business is or is not qualified, citing specific details from the website content.\",\n"
                             "  \"business_name\": \"The name of the business or organization.\",\n"
-                            "  \"contact_email\": \"The contact email address found in the website content, or null if none was found.\",\n"
+                            "  \"contact_email\": \"The best contact email address found in the website content, or null if none was found.\",\n"
+                            "  \"contact_emails\": [\"list\", \"of\", \"all\", \"unique\", \"emails\", \"found\"],\n"
                             "  \"automation_score\": integer (1 to 100 rating how automated their booking flow is, where 1 = fully manual/static and 100 = highly automated)\n"
                             "}\n\n"
                             "CRITICAL: You must output ONLY the raw JSON object and nothing else."
@@ -272,6 +282,19 @@ async def analyze_single_lead(
                 
                 # Parse and validate with Pydantic
                 qualification = LeadQualification.model_validate(qualification_data)
+                
+                # Combine the emails found by the direct Regex scanner with any emails extracted by the LLM
+                all_emails = set(scraped_emails)
+                if qualification.contact_emails:
+                    all_emails.update(qualification.contact_emails)
+                if qualification.contact_email:
+                    all_emails.add(qualification.contact_email)
+                
+                # Clean, filter, and set back
+                from crawler import clean_and_filter_emails
+                final_emails = clean_and_filter_emails(all_emails)
+                qualification.contact_emails = final_emails
+                qualification.contact_email = final_emails[0] if final_emails else None
                 
                 logger.info(f"[QUALIFICATION RESULT] {url} -> Qualified: {qualification.is_qualified} | Score: {qualification.automation_score} (via {provider['name']})")
                 await save_analyzed_lead_async(output_file, url, qualification)
@@ -332,7 +355,8 @@ async def main_async() -> None:
                         await save_analyzed_lead_async(output_path, url, None, error="Unsuccessful crawl or missing markdown.")
                         continue
 
-                    leads_to_process.append((url, raw_markdown))
+                    scraped_emails = data.get("scraped_emails") or []
+                    leads_to_process.append((url, raw_markdown, scraped_emails))
                 except json.JSONDecodeError:
                     logger.warning("Malformed JSON line skipped in input file.")
                     continue
@@ -349,8 +373,8 @@ async def main_async() -> None:
     # 3. Process concurrently using Semaphore
     semaphore = asyncio.Semaphore(args.concurrency)
     tasks = [
-        analyze_single_lead(url, markdown, output_path, semaphore)
-        for url, markdown in leads_to_process
+        analyze_single_lead(url, markdown, scraped_emails, output_path, semaphore)
+        for url, markdown, scraped_emails in leads_to_process
     ]
     
     await asyncio.gather(*tasks)

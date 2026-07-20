@@ -28,6 +28,62 @@ logging.basicConfig(
 logger = logging.getLogger("lead-gen-crawler")
 
 
+def clean_and_filter_emails(emails_set) -> List[str]:
+    """Deduplicates and cleans emails, filtering out false positives (images, static files, dev assets)."""
+    valid_emails = []
+    invalid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.css', '.js', '.pdf', '.ico')
+    ignored_domains = ('sentry.io', 'wix.com', 'domain.com', 'example.com', 'yourdomain.com', 'bootstrap.com', 'jquery.com', 'wixpress.com')
+    for email in emails_set:
+        email = email.strip().lower()
+        if "@" not in email:
+            continue
+        if email.endswith(invalid_extensions):
+            continue
+        if any(ext in email for ext in invalid_extensions):
+            continue
+        domain = email.split("@")[-1]
+        if domain in ignored_domains:
+            continue
+        if any(dom in domain for dom in ignored_domains):
+            continue
+        valid_emails.append(email)
+    return sorted(list(set(valid_emails)))
+
+
+def extract_internal_links(base_url: str, html: str) -> List[str]:
+    """Parses raw HTML to find same-domain internal links for contact, about, or team subpages."""
+    if not html:
+        return []
+    # Simple regex to find hrefs
+    hrefs = re.findall(r'href=["\'](.*?)["\']', html)
+    internal_links = []
+    
+    # Common contact path patterns
+    patterns = [
+        r"contact",
+        r"about",
+        r"team",
+    ]
+    from urllib.parse import urljoin, urlparse
+    try:
+        base_domain = urlparse(base_url).netloc
+        for href in hrefs:
+            if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                continue
+            full_url = urljoin(base_url, href)
+            parsed = urlparse(full_url)
+            if parsed.netloc == base_domain:
+                path = parsed.path.lower()
+                if any(re.search(pat, path) for pat in patterns):
+                    # Strip fragment/query to normalize
+                    normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    internal_links.append(normalized)
+    except Exception as e:
+        logger.warning(f"Error parsing links for {base_url}: {e}")
+        
+    return sorted(list(set(internal_links)))
+
+
 def parse_arguments() -> argparse.Namespace:
     """Parses command line arguments."""
     parser = argparse.ArgumentParser(
@@ -164,7 +220,7 @@ async def load_already_crawled_async(file_path: Path, retry_failed: bool = False
     return crawled_urls
 
 
-async def save_crawl_result_async(file_path: Path, url: str, result: CrawlResult) -> None:
+async def save_crawl_result_async(file_path: Path, url: str, result: CrawlResult, scraped_emails: List[str]) -> None:
     """Saves a single crawl result to the output JSONL file immediately."""
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -174,6 +230,7 @@ async def save_crawl_result_async(file_path: Path, url: str, result: CrawlResult
         "success": result.success,
         "error_message": result.error_message if not result.success else None,
         "status_code": getattr(result, "status_code", None),
+        "scraped_emails": scraped_emails,
         "markdown": {
             "raw_markdown": result.markdown.raw_markdown if result.success and result.markdown else None,
             "fit_markdown": result.markdown.fit_markdown if result.success and result.markdown else None,
@@ -236,15 +293,47 @@ async def run_crawler(
             
             async for result in results_generator:
                 url = result.url
+                valid_emails = []
+                
                 if result.success:
                     success_count += 1
                     logger.info(f"[SUCCESS] {success_count}/{len(urls_to_crawl)} - Crawled: {url}")
+                    
+                    # Regex extraction on raw HTML
+                    homepage_html = result.html if result.html else ""
+                    raw_emails = set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", homepage_html))
+                    valid_emails = clean_and_filter_emails(raw_emails)
+                    
+                    # Deep Crawl / Subpage Fallback if no email is found on the primary URL
+                    if not valid_emails and homepage_html:
+                        subpage_urls = extract_internal_links(url, homepage_html)
+                        subpage_urls = subpage_urls[:3]  # Crawl up to top 3 subpages
+                        
+                        if subpage_urls:
+                            logger.info(f"No emails on homepage {url}. Deep crawling subpages: {subpage_urls}")
+                            for sub_url in subpage_urls:
+                                try:
+                                    # Fetch subpage using the crawler
+                                    sub_res = await crawler.arun(url=sub_url, config=run_config)
+                                    if sub_res.success and sub_res.html:
+                                        sub_emails = set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", sub_res.html))
+                                        sub_valid = clean_and_filter_emails(sub_emails)
+                                        if sub_valid:
+                                            logger.info(f"[DEEP CRAWL SUCCESS] Found emails on subpage {sub_url}: {sub_valid}")
+                                            valid_emails.extend(sub_valid)
+                                            # We can break early if we find an email on any subpage
+                                            break
+                                except Exception as sub_e:
+                                    logger.warning(f"Failed to crawl fallback subpage {sub_url}: {sub_e}")
                 else:
                     failed_count += 1
                     logger.error(f"[FAILED] {failed_count}/{len(urls_to_crawl)} - Crawled: {url} | Error: {result.error_message}")
                 
+                # Normalize, deduplicate and sort emails
+                valid_emails = sorted(list(set(valid_emails)))
+                
                 # Write output to local leads.jsonl file immediately (crash-resilient)
-                await save_crawl_result_async(output_file, url, result)
+                await save_crawl_result_async(output_file, url, result, valid_emails)
                 
             logger.info(f"Crawl completed. Success: {success_count}, Failed: {failed_count}.")
         except Exception as e:

@@ -12,6 +12,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Set, Dict, List, Any, Optional, Tuple
@@ -44,6 +45,89 @@ logger = logging.getLogger("lead-enricher")
 def get_api_key() -> Optional[str]:
     """Retrieves Apollo.io API key from environment variables."""
     return os.getenv("APOLLO_API_KEY")
+
+
+def get_serper_api_key() -> Optional[str]:
+    """Retrieves Serper API key from environment variables."""
+    return os.getenv("SERPER_API_KEY")
+
+
+def get_query_location(lead: Dict[str, Any]) -> str:
+    """Extracts city/region location from lead address for search queries."""
+    if lead.get("city"):
+        return lead.get("city")
+    
+    address = lead.get("address") or lead.get("formatted_address")
+    if address:
+        parts = address.split(",")
+        if len(parts) > 1:
+            city_part = parts[1].strip()
+            return city_part
+    return ""
+
+
+async def search_serper_google_fallback(
+    client: httpx.AsyncClient,
+    query: str,
+    api_key: str
+) -> List[str]:
+    """Queries Serper.dev Google Search API and extracts emails from snippet results."""
+    if not api_key:
+        return []
+        
+    url = "https://google.serper.dev/search"
+    payload = {"q": query}
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        logger.info(f"[SERPER FALLBACK] Querying Google Search: '{query}'...")
+        response = await client.post(url, headers=headers, json=payload, timeout=20.0)
+        response.raise_for_status()
+        data = response.json()
+        
+        organic = data.get("organic", [])
+        snippets = []
+        for item in organic:
+            if item.get("snippet"):
+                snippets.append(item["snippet"])
+            if item.get("title"):
+                snippets.append(item["title"])
+                
+        # Parse emails using regex
+        emails = []
+        email_pattern = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+        for text in snippets:
+            found = email_pattern.findall(text)
+            if found:
+                emails.extend(found)
+                
+        # Filter and clean
+        valid_emails = []
+        invalid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.css', '.js', '.pdf', '.ico')
+        ignored_domains = ('sentry.io', 'wix.com', 'domain.com', 'example.com', 'yourdomain.com', 'bootstrap.com', 'jquery.com', 'wixpress.com')
+        for email in emails:
+            email = email.strip().lower()
+            if "@" not in email:
+                continue
+            if email.endswith(invalid_extensions):
+                continue
+            if any(ext in email for ext in invalid_extensions):
+                continue
+            domain = email.split("@")[-1]
+            if domain in ignored_domains:
+                continue
+            if any(dom in domain for dom in ignored_domains):
+                continue
+            valid_emails.append(email)
+            
+        return sorted(list(set(valid_emails)))
+        
+    except Exception as e:
+        logger.error(f"[SERPER FALLBACK ERROR] Serper Search request failed: {e}")
+        return []
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -121,6 +205,57 @@ async def load_already_enriched(file_path: Path) -> Tuple[Set[str], Set[str]]:
     return enriched_names, enriched_urls
 
 
+# Helper function to resolve cascading email
+def resolve_cascading_email(contact: Optional[Dict[str, Any]], original_lead: Dict[str, Any]) -> Optional[str]:
+    # 1. Apollo Decision Maker Email (if found via API search)
+    if contact and contact.get("email"):
+        return contact.get("email")
+
+    # Gather all website scraped emails
+    scraped_emails = []
+    # Try contact_emails list first
+    if "contact_emails" in original_lead and isinstance(original_lead["contact_emails"], list):
+        scraped_emails.extend(original_lead["contact_emails"])
+    # Try scraped_emails (from crawler payload)
+    if "scraped_emails" in original_lead and isinstance(original_lead["scraped_emails"], list):
+        scraped_emails.extend(original_lead["scraped_emails"])
+    # Add primary contact_email
+    if original_lead.get("contact_email"):
+        scraped_emails.append(original_lead["contact_email"])
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_scraped = []
+    for email in scraped_emails:
+        if email and email.strip().lower() not in seen:
+            seen.add(email.strip().lower())
+            unique_scraped.append(email.strip())
+
+    # Prefixes of generic emails
+    generic_prefixes = (
+        "info@", "contact@", "sales@", "hello@", "support@", "office@",
+        "admin@", "mail@", "billing@", "jobs@", "careers@", "team@",
+        "service@", "webmaster@", "help@", "press@", "marketing@"
+    )
+
+    # 2. Website Scraped Email (personal/specific)
+    # Filter unique_scraped to find non-generic emails first
+    for email in unique_scraped:
+        email_lower = email.lower()
+        if not any(email_lower.startswith(prefix) for prefix in generic_prefixes):
+            return email
+
+    # 3. Generic Domain Contact (if available)
+    # If no specific email is found, return the first generic email
+    for email in unique_scraped:
+        email_lower = email.lower()
+        if any(email_lower.startswith(prefix) for prefix in generic_prefixes):
+            return email
+
+    # Fallback to whatever was originally in contact_email
+    return original_lead.get("contact_email")
+
+
 async def save_enriched_contact_async(
     file_path: Path,
     original_lead: Dict[str, Any],
@@ -137,7 +272,7 @@ async def save_enriched_contact_async(
         "contact_first_name": contact.get("first_name") if contact else None,
         "contact_last_name": contact.get("last_name") if contact else None,
         "contact_title": contact.get("title") if contact else None,
-        "contact_email": contact.get("email") if (contact and contact.get("email")) else original_lead.get("contact_email"),
+        "contact_email": resolve_cascading_email(contact, original_lead),
         "contact_email_status": contact.get("email_status") if contact else None,
         "contact_linkedin": contact.get("linkedin_url") if contact else None,
         "lead_qualification_reason": original_lead.get("reason"),
@@ -238,33 +373,53 @@ async def enrich_single_lead(
         # 2. Query Apollo
         data = await query_apollo_with_backoff(client, payload, api_key)
         
-        if not data:
-            await save_enriched_contact_async(output_path, lead, None, error="Apollo query failed or returned no data.")
-            return
-
-        # 3. Harvest contacts
-        people = data.get("people", [])
-        if not people:
-            logger.info(f"No matching executives found for: {business_name}")
-            await save_enriched_contact_async(output_path, lead, None, error="No contacts found.")
-            return
-
-        # Take the first matching contact for simplicity (or we can save all; the user said 'the person's first_name...')
-        # Let's save the first one that has an email, or default to the first one returned
+        people = []
+        if data:
+            people = data.get("people", [])
+            
         best_contact = None
-        for p in people:
-            if p.get("email"):
-                best_contact = p
-                break
-        
-        if not best_contact:
-            best_contact = people[0]
+        if people:
+            for p in people:
+                if p.get("email"):
+                    best_contact = p
+                    break
+            if not best_contact:
+                best_contact = people[0]
 
-        logger.info(
-            f"[ENRICHED] {business_name} -> Contact: {best_contact.get('first_name')} {best_contact.get('last_name')} "
-            f"({best_contact.get('title')}) - Email: {best_contact.get('email')}"
-        )
-        await save_enriched_contact_async(output_path, lead, best_contact)
+        # 3. Check if Apollo found a contact with a valid email
+        if best_contact and best_contact.get("email"):
+            logger.info(
+                f"[ENRICHED] {business_name} -> Contact: {best_contact.get('first_name')} {best_contact.get('last_name')} "
+                f"({best_contact.get('title')}) - Email: {best_contact.get('email')}"
+            )
+            await save_enriched_contact_async(output_path, lead, best_contact)
+            return
+
+        # OTHERWISE: Apollo 403, error, or no email found. Execute Serper Google Search Fallback!
+        logger.warning(f"Apollo enrichment failed to locate contact email for: {business_name}. Launching Serper Fallback...")
+        
+        serper_key = get_serper_api_key()
+        fallback_emails = []
+        if serper_key:
+            city = get_query_location(lead)
+            search_query = f"{business_name} {city} email OR contact".strip()
+            fallback_emails = await search_serper_google_fallback(client, search_query, serper_key)
+            
+        if fallback_emails:
+            serper_email = fallback_emails[0]
+            mock_contact = {
+                "first_name": "Decision Maker",
+                "last_name": "",
+                "title": "Contact",
+                "email": serper_email,
+                "email_status": "scraped_via_serper"
+            }
+            logger.info(f"[SERPER FALLBACK SUCCESS] Found email for {business_name}: {serper_email}")
+            await save_enriched_contact_async(output_path, lead, mock_contact)
+        else:
+            # If both fail, save_enriched_contact_async with None contact will auto-cascade to Crawl4AI crawled emails
+            logger.info(f"[NO CONTACT FOUND] Apollo & Serper failed for {business_name}. Falling back to Crawl4AI website scraped emails.")
+            await save_enriched_contact_async(output_path, lead, None, error="Apollo & Serper fallback found no contacts.")
 
 
 async def main_async() -> None:
