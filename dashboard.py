@@ -5,6 +5,10 @@ import time
 from pathlib import Path
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
+
+# Load local .env variables
+load_dotenv()
 
 # Set Page Config
 st.set_page_config(
