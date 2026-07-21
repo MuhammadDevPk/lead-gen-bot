@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import List, Set, Optional
 
 import aiofiles
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode, CrawlResult
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, CrawlResult
 from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher, RateLimiter
 
 # Configure Logger
@@ -267,7 +267,14 @@ async def run_crawler(
 
     logger.info(f"Starting crawl for {len(urls_to_crawl)} URLs with concurrency={concurrency}...")
 
-    # 2. Configure Crawler
+    # 2. Configure Browser & Crawler Settings
+    browser_config = BrowserConfig(
+        headless=True,
+        enable_stealth=True,
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        extra_args=["--disable-gpu", "--no-sandbox"]
+    )
+
     run_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
         stream=True,
@@ -280,7 +287,7 @@ async def run_crawler(
     )
 
     # 3. Visit each URL
-    async with AsyncWebCrawler() as crawler:
+    async with AsyncWebCrawler(config=browser_config) as crawler:
         try:
             results_generator = await crawler.arun_many(
                 urls=urls_to_crawl,

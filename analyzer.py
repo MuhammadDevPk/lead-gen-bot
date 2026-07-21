@@ -136,6 +136,10 @@ class LeadQualification(BaseModel):
         ...,
         description="An integer from 1 to 100 rating how automated their customer acquisition/booking flow is (1 = fully manual/static, 100 = highly automated with widgets/schedulers)."
     )
+    personalization_hook: str = Field(
+        ...,
+        description="A compelling, human-like 2-sentence pitch addressing the business's specific weakness: Sentence 1 points out their website/sourcing gap and lost revenue, and Sentence 2 states how an automated system/modern site boosts bookings and revenue."
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -200,6 +204,7 @@ async def save_analyzed_lead_async(file_path: Path, url: str, qualification: Opt
         "contact_email": qualification.contact_email if qualification else None,
         "contact_emails": qualification.contact_emails if qualification else [],
         "automation_score": qualification.automation_score if qualification else 0,
+        "personalization_hook": qualification.personalization_hook if qualification else "",
         "error": error
     }
 
@@ -242,6 +247,13 @@ async def analyze_single_lead(
                             "Email Harvesting Rules:\n"
                             "- Extract all valid email addresses found in the website content. Place them in the 'contact_emails' list.\n"
                             "- Set the primary 'contact_email' to the best direct contact email found. Categorize any valid business email (e.g., info@..., sales@..., hello@..., or staff members) as a valid contact target if a specific owner email is not explicitly present.\n\n"
+                            "Personalization Hook Generation:\n"
+                            "Based on your website analysis, classify their weakness into one of these two Cases:\n"
+                            "- Case B (Has Website, Outdated Design/Bad UI/UX): Use if the website is slow, outdated, has design flaws, or is not mobile-responsive. Generate a hook offering a modern redesign.\n"
+                            "- Case C (Has Website, Missing Automation/Booking): Use if the website looks modern but lacks automated booking, calendar sync, or lead-capture tools. Generate a hook offering automated scheduling, calendar widgets, and chatbot agents to convert traffic.\n\n"
+                            "Write a compelling, human-like 2-sentence pitch matching this chosen Case and store it in 'personalization_hook':\n"
+                            "- Sentence 1 (The Pain Point): Point out their specific website gap (outdated layout / slow speed / missing automated booking) and the customers/revenue they are losing because of it.\n"
+                            "- Sentence 2 (The Solution): State how our redesign (for Case B) or automated booking widgets/chatbots (for Case C) solves this and boosts their revenue.\n\n"
                             "Return a JSON object conforming exactly to this schema:\n"
                             "{\n"
                             "  \"is_qualified\": boolean,\n"
@@ -249,7 +261,8 @@ async def analyze_single_lead(
                             "  \"business_name\": \"The name of the business or organization.\",\n"
                             "  \"contact_email\": \"The best contact email address found in the website content, or null if none was found.\",\n"
                             "  \"contact_emails\": [\"list\", \"of\", \"all\", \"unique\", \"emails\", \"found\"],\n"
-                            "  \"automation_score\": integer (1 to 100 rating how automated their booking flow is, where 1 = fully manual/static and 100 = highly automated)\n"
+                            "  \"automation_score\": integer (1 to 100 rating how automated their booking flow is, where 1 = fully manual/static and 100 = highly automated),\n"
+                            "  \"personalization_hook\": \"AI-generated 2-sentence pain-solution hook\"\n"
                             "}\n\n"
                             "CRITICAL: You must output ONLY the raw JSON object and nothing else."
                         )

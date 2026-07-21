@@ -141,10 +141,66 @@ async def query_serper_places(query: str, api_key: str) -> List[Dict[str, Any]]:
             raise
 
 
+async def verify_business_website(business_name: str, address: Optional[str], api_key: str) -> Optional[str]:
+    """Queries Serper Google Search to check if a business actually owns a website (double verification)."""
+    from urllib.parse import urlparse
+    city = ""
+    if address:
+        parts = address.split(",")
+        if len(parts) > 1:
+            city = parts[1].strip()
+            
+    query = f"{business_name} {city}".strip()
+    url = "https://google.serper.dev/search"
+    payload = {"q": query}
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    # Common directory domains to exclude
+    directory_exclusions = (
+        "yelp.com", "tripadvisor.com", "facebook.com", "yellowpages.com", "groupon.com",
+        "mapquest.com", "foursquare.com", "instagram.com", "linkedin.com", "twitter.com",
+        "pinterest.com", "grubhub.com", "opentable.com", "doordash.com", "ubereats.com",
+        "wikipedia.org", "yahoo.com", "local.yahoo.com", "realtor.com",
+        "zillow.com", "trulia.com", "angi.com", "homeadvisor.com", "nextdoor.com"
+    )
+    
+    try:
+        logger.info(f"[DOUBLE-VERIFY] Checking if {business_name} in {city} has an official website...")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload, timeout=15.0)
+            response.raise_for_status()
+            data = response.json()
+            
+        organic = data.get("organic", [])
+        for item in organic:
+            link = item.get("link")
+            if not link:
+                continue
+            
+            parsed = urlparse(link)
+            domain = parsed.netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+                
+            # Check if domain is a directory
+            if not any(ex in domain for ex in directory_exclusions):
+                logger.info(f"[DOUBLE-VERIFY FOUND SITE] {business_name} actually owns website: {link}")
+                return link
+                
+        return None
+    except Exception as e:
+        logger.error(f"Error double-verifying website for {business_name}: {e}")
+        return None
+
+
 async def process_leads(
     places: List[Dict[str, Any]],
     urls_file: Path,
-    no_website_file: Path
+    no_website_file: Path,
+    api_key: str
 ) -> None:
     """Processes search results and splits them into website URLs and no-website JSONL leads."""
     # Ensure parent directories exist
@@ -165,6 +221,15 @@ async def process_leads(
             title = place.get("title", "Unknown")
             website = place.get("website", "").strip()
             phone = place.get("phoneNumber", "").strip()
+            address = place.get("address", "")
+
+            # If Serper Places claims no website, double-verify using standard Google search fallback
+            if not website:
+                # Sleep briefly to be respectful to API rate limits
+                await asyncio.sleep(0.5)
+                website_verified = await verify_business_website(title, address, api_key)
+                if website_verified:
+                    website = website_verified.strip()
 
             if website:
                 # Clean URL (strip whitespace)
@@ -218,7 +283,7 @@ async def main_async() -> None:
             logger.info("No places found for the search query.")
             return
 
-        await process_leads(places, urls_file, no_website_file)
+        await process_leads(places, urls_file, no_website_file, api_key)
     except Exception as e:
         logger.error(f"Sourcing failed: {e}")
         sys.exit(1)

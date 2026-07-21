@@ -254,6 +254,15 @@ def resolve_cascading_email(contact: Optional[Dict[str, Any]], original_lead: Di
 
     # Fallback to whatever was originally in contact_email
     return original_lead.get("contact_email")
+# Helper function to sanitize first names
+def sanitize_first_name(first_name: Optional[str]) -> str:
+    """Cleans the first name; returns 'there' if missing, empty, 'Decision Maker', or 'Unknown'."""
+    if not first_name:
+        return "there"
+    name_strip = first_name.strip()
+    if name_strip.lower() in ("decision maker", "unknown", ""):
+        return "there"
+    return name_strip
 
 
 async def save_enriched_contact_async(
@@ -265,17 +274,50 @@ async def save_enriched_contact_async(
     """Appends an enriched lead record immediately to the output JSONL file for crash-resilience."""
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
+    fname = contact.get("first_name") if contact else None
+    
+    # Resolve personalization hook
+    # If present in original qualified lead, preserve it. Else, generate a fallback.
+    personalization_hook = original_lead.get("personalization_hook")
+    reason = original_lead.get("reason") or original_lead.get("lead_qualification_reason")
+    
+    if not personalization_hook:
+        url = original_lead.get("url")
+        if not url:
+            personalization_hook = (
+                "I noticed your business doesn't have an active website online, which means you're missing out "
+                "on local search clients searching for services in your area. A simple, modern landing page "
+                "with booking automation can capture these leads and boost your revenue."
+            )
+        else:
+            if not reason:
+                reason = "lacks a modern automated booking system"
+            clean_reason = reason.strip().rstrip(".")
+            if clean_reason.lower().startswith(("the business", "this business")):
+                personalization_hook = (
+                    f"I took a look at your website. {clean_reason} "
+                    "Implementing an automated booking system or modern layout could capture these lost visitors and "
+                    "significantly increase your booking rate."
+                )
+            else:
+                personalization_hook = (
+                    f"I took a look at your website and noticed it looks like it {clean_reason}. "
+                    "Implementing an automated booking system or modern layout could capture these lost visitors and "
+                    "significantly increase your booking rate."
+                )
+
     payload = {
         "business_name": original_lead.get("business_name") or original_lead.get("title") or "Unknown",
         "url": original_lead.get("url"),
         "phone": original_lead.get("phone") or original_lead.get("phoneNumber"),
-        "contact_first_name": contact.get("first_name") if contact else None,
+        "contact_first_name": sanitize_first_name(fname),
         "contact_last_name": contact.get("last_name") if contact else None,
         "contact_title": contact.get("title") if contact else None,
         "contact_email": resolve_cascading_email(contact, original_lead),
         "contact_email_status": contact.get("email_status") if contact else None,
         "contact_linkedin": contact.get("linkedin_url") if contact else None,
-        "lead_qualification_reason": original_lead.get("reason"),
+        "lead_qualification_reason": reason,
+        "personalization_hook": personalization_hook.strip(),
         "enriched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "error": error
     }

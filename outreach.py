@@ -43,6 +43,16 @@ logger = logging.getLogger("lead-outreach")
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 
 
+def sanitize_first_name(first_name: Optional[str]) -> str:
+    """Cleans the first name; returns 'there' if missing, empty, 'Decision Maker', or 'Unknown'."""
+    if not first_name:
+        return "there"
+    name_strip = first_name.strip()
+    if name_strip.lower() in ("decision maker", "unknown", ""):
+        return "there"
+    return name_strip
+
+
 def get_credentials() -> Tuple[Optional[str], Optional[str]]:
     """Retrieves Instantly API credentials from environment variables."""
     api_key = os.getenv("INSTANTLY_API_KEY")
@@ -121,19 +131,39 @@ def is_valid_email(email: Optional[str]) -> bool:
 
 def generate_personalization(lead: Dict[str, Any]) -> str:
     """Generates dynamic personalization intro lines based on lead properties."""
-    url = lead.get("url")
-    reason = lead.get("lead_qualification_reason")
+    # 1. Prioritize AI-generated personalization hook if present
+    hook = lead.get("personalization_hook")
+    if hook:
+        return hook.strip()
 
-    if url:
-        # Lead has a website but failed qualification automation check
-        if not reason:
-            reason = "revenue from manual scheduling delays"
-        # Strip trailing periods/whitespace from reason for clean sentence insertion
-        clean_reason = reason.strip().rstrip(".")
-        return f"took a look at your site and noticed you don't have an automated booking sync. It's likely leaking {clean_reason}."
-    else:
+    # Fallback to structured copy writing lines
+    url = lead.get("url")
+    reason = lead.get("lead_qualification_reason") or lead.get("reason")
+
+    if not url:
         # Hot lead without website
-        return "noticed your business doesn't have an active web portal on Google Maps."
+        return (
+            "I noticed your business doesn't have an active website online, which means you're missing out "
+            "on local search clients searching for services in your area. A simple, modern landing page "
+            "with booking automation can capture these leads and boost your revenue."
+        )
+    else:
+        # Lead has a website but failed qualification check
+        if not reason:
+            reason = "lacks a modern automated booking system"
+        clean_reason = reason.strip().rstrip(".")
+        if clean_reason.lower().startswith(("the business", "this business")):
+            return (
+                f"I took a look at your website. {clean_reason} "
+                "Implementing an automated booking system or modern layout could capture these lost visitors and "
+                "significantly increase your booking rate."
+            )
+        else:
+            return (
+                f"I took a look at your website and noticed it looks like it {clean_reason}. "
+                "Implementing an automated booking system or modern layout could capture these lost visitors and "
+                "significantly increase your booking rate."
+            )
 
 
 async def inject_lead_with_backoff(
@@ -195,8 +225,83 @@ async def inject_lead_with_backoff(
     return False
 
 
+async def migrate_existing_leads_files() -> None:
+    """Updates all existing enriched leads JSONL files with cleaned names and personalization hooks."""
+    data_dir = Path("data")
+    if not data_dir.exists():
+        return
+        
+    files_to_update = list(data_dir.glob("*enriched_leads.jsonl"))
+    
+    for file_path in files_to_update:
+        logger.info(f"Migrating and updating names/hooks in existing file: {file_path}")
+        temp_path = file_path.with_suffix(".tmp")
+        
+        try:
+            records = []
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        lead = json.loads(line)
+                        fname = lead.get("contact_first_name")
+                        lead["contact_first_name"] = sanitize_first_name(fname)
+                        
+                        hook = lead.get("personalization_hook")
+                        if hook and ("noticed it looks like it The business" in hook or "noticed it looks like it This business" in hook):
+                            hook = None
+                            
+                        if not hook:
+                            url = lead.get("url")
+                            reason = lead.get("lead_qualification_reason") or lead.get("reason")
+                            if not url:
+                                lead["personalization_hook"] = (
+                                    "I noticed your business doesn't have an active website online, which means you're missing out "
+                                    "on local search clients searching for services in your area. A simple, modern landing page "
+                                    "with booking automation can capture these leads and boost your revenue."
+                                )
+                            else:
+                                if not reason:
+                                    reason = "lacks a modern automated booking system"
+                                clean_reason = reason.strip().rstrip(".")
+                                if clean_reason.lower().startswith(("the business", "this business")):
+                                    lead["personalization_hook"] = (
+                                        f"I took a look at your website. {clean_reason} "
+                                        "Implementing an automated booking system or modern layout could capture these lost visitors and "
+                                        "significantly increase your booking rate."
+                                    )
+                                else:
+                                    lead["personalization_hook"] = (
+                                        f"I took a look at your website and noticed it looks like it {clean_reason}. "
+                                        "Implementing an automated booking system or modern layout could capture these lost visitors and "
+                                        "significantly increase your booking rate."
+                                    )
+                        records.append(lead)
+                    except json.JSONDecodeError:
+                        continue
+            
+            async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
+                for record in records:
+                    await f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            
+            os.replace(temp_path, file_path)
+            logger.info(f"Successfully migrated {len(records)} records in {file_path}.")
+            
+        except Exception as e:
+            logger.error(f"Failed to migrate file {file_path}: {e}")
+            if temp_path.exists():
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+
+
 async def main_async() -> None:
     """Async main routine."""
+    # Run the existing files migration first to sanitize all records
+    await migrate_existing_leads_files()
     args = parse_arguments()
     input_path = Path(args.input_file)
     tracker_path = Path(args.tracker_file)
@@ -266,7 +371,7 @@ async def main_async() -> None:
     async with httpx.AsyncClient() as client:
         for idx, lead in enumerate(leads_to_run):
             email = lead["contact_email"]
-            first_name = lead.get("contact_first_name") or "there"
+            first_name = sanitize_first_name(lead.get("contact_first_name"))
             last_name = lead.get("contact_last_name") or ""
             company_name = lead.get("business_name") or "your business"
             personalization = generate_personalization(lead)
